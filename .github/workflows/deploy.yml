@@ -55,7 +55,5 @@ jobs:
             --restart-policy Always \
             --os-type Linux \
             --environment-variables NODE_ENV=production
-            --dns-name-label reactapp$RANDOM \
+            --dns-name-label reactapp${{ github.run_number }} \
             --overwrite-existing
-
-            
