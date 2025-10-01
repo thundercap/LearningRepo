@@ -63,4 +63,5 @@ jobs:
             --restart-policy Always \
             --os-type Linux \
             --ip-address Public \
+            --dns-name-label ${{ secrets.ACI_DNS_LABEL }} \
             --environment-variables NODE_ENV=production
