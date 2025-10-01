@@ -54,4 +54,3 @@ jobs:
             --ports 80 \
             --restart-policy Always \
             --environment-variables NODE_ENV=production
-
