@@ -54,6 +54,6 @@ jobs:
             --ports 80 \
             --restart-policy Always \
             --os-type Linux \
+            --ip-address Public \
             --environment-variables NODE_ENV=production
-            --dns-name-label reactapp${{ github.run_number }} \
             --overwrite-existing
