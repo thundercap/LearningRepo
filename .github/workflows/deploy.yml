@@ -40,6 +40,14 @@ jobs:
               "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
             }
 
+      - name: Delete existing ACI (if any)
+        run: |
+          az container delete \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --name ${{ secrets.AZURE_CONTAINER_NAME }} \
+            --yes || true
+
+
       # Deploy to Azure Container Instance
       - name: Deploy to ACI
         run: |
@@ -56,4 +64,3 @@ jobs:
             --os-type Linux \
             --ip-address Public \
             --environment-variables NODE_ENV=production
-            --overwrite-existing
