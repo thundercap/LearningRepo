@@ -57,3 +57,5 @@ jobs:
             --environment-variables NODE_ENV=production
             --dns-name-label reactapp$RANDOM \
             --overwrite-existing
+
+            
