@@ -5,26 +5,74 @@ on:
     branches:
       - main   # or your deploy branch
 
-jobs:
-  build-scan-and-deploy:
-    runs-on: ubuntu-latest
+env:
+  IMAGE_NAME: ${{ secrets.DOCKER_USERNAME }}/react-app
+  NODE_VERSION: '18'
 
+jobs:
+  # ------------------------------
+  # 1. Build Job
+  # ------------------------------
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.set-image-tag.outputs.tag }}
     steps:
-      # Checkout repository
       - name: Checkout Code
         uses: actions/checkout@v3
 
-      # Setup Node.js
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: ${{ env.NODE_VERSION }}
 
-      # Install dependencies
       - name: Install Dependencies
         run: npm ci
 
-      # Run SonarQube Scan (SAST)
+      - name: Run Unit Tests
+        run: npm test -- --coverage
+
+      - name: Upload Test Coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 30
+
+      - name: Set Docker Image Tag (Git SHA)
+        id: set-image-tag
+        run: echo "tag=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Build Docker Image (Multi-stage)
+        run: |
+          docker build -t $IMAGE_NAME:${{ steps.set-image-tag.outputs.tag }} .
+
+      - name: Upload Docker Image for Later Jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: |
+            Dockerfile
+            # optional: context files if needed
+
+  # ------------------------------
+  # 2. Scan Job (SAST, SCA, DAST)
+  # ------------------------------
+  scan:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # ------------------
+      # SonarQube SAST
+      # ------------------
       - name: SonarQube Scan
         uses: sonarsource/sonarqube-scan-action@v2
         with:
@@ -35,64 +83,83 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
-      # Enforce Quality Gate
       - name: SonarQube Quality Gate
         uses: sonarsource/sonarqube-quality-gate-action@v1
         timeout-minutes: 5
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
-      # Docker Hub login
-      - name: Log in to Docker Hub
+      # ------------------
+      # Grype SCA
+      # ------------------
+      - name: Docker Hub Login
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      # Build Docker Image
-      - name: Build Docker Image
+      - name: Build Docker Image for Scan
         run: |
-          IMAGE_NAME=${{ secrets.DOCKER_USERNAME }}/react-app
-          docker build -t $IMAGE_NAME:latest .
+          docker build -t $IMAGE_NAME:${{ needs.build.outputs.image-tag }} .
 
-      # Run Grype Image Scan and Save Report
       - name: Run Grype Scan
         run: |
-          IMAGE_NAME=${{ secrets.DOCKER_USERNAME }}/react-app:latest
-          echo "Running Grype vulnerability scan..."
           curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo sh -s -- -b /usr/local/bin
           mkdir -p grype-reports
-          grype $IMAGE_NAME:latest -o json > grype-reports/scan-report.json || true
-          grype $IMAGE_NAME:latest -o table > grype-reports/scan-report.txt || true
+          grype $IMAGE_NAME:${{ needs.build.outputs.image-tag }} -o json > grype-reports/scan-report.json || true
+          grype $IMAGE_NAME:${{ needs.build.outputs.image-tag }} -o table > grype-reports/scan-report.txt || true
 
-      # Upload Grype Report as Artifact
-      - name: Upload Grype Scan Reports
+      - name: Upload Grype Reports
         uses: actions/upload-artifact@v4
         with:
           name: grype-scan-reports
           path: grype-reports/
-          retention-days: 30   # Keep for 30 days (adjust as needed)
+          retention-days: 30
 
-      # Fail if critical vulnerabilities are found
-      - name: Enforce Vulnerability Policy
+      - name: Enforce Grype Policy
         run: |
-          CRITICAL_COUNT=$(jq '[.matches[] | select(.vulnerability.severity=="Critical")] | length' grype-reports/scan-report.json)
-          if [ "$CRITICAL_COUNT" -gt 0 ]; then
-            echo "Found $CRITICAL_COUNT Critical vulnerabilities. Failing build."
+          HIGH_COUNT=$(jq '[.matches[] | select(.vulnerability.severity=="High" or .vulnerability.severity=="Critical")] | length' grype-reports/scan-report.json)
+          if [ "$HIGH_COUNT" -gt 0 ]; then
+            echo "Found $HIGH_COUNT High/Critical vulnerabilities. Failing build."
             exit 1
-          else
-            echo "No critical vulnerabilities found."
           fi
 
-      # Push Docker Image (only if scan passes)
-      - name: Push Docker Image
-        if: success()
-        run: |
-          IMAGE_NAME=${{ secrets.DOCKER_USERNAME }}/react-app
-          docker push $IMAGE_NAME:latest
+      # ------------------
+      # OWASP ZAP DAST (Staging URL)
+      # ------------------
+      - name: Install OWASP ZAP
+        run: sudo apt-get update && sudo apt-get install -y zaproxy
 
-      # Azure Login
-      - name: Azure CLI Login
+      - name: Run DAST Scan
+        run: |
+          TARGET_URL="http://${{ secrets.ACI_DNS_LABEL }}.azurecontainer.io"
+          mkdir -p dast-reports
+          zap-cli quick-scan --self-contained -r dast-reports/dast-report.html $TARGET_URL
+
+      - name: Upload DAST Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dast-report
+          path: dast-reports/
+          retention-days: 30
+
+      - name: Fail on High/Critical DAST Findings
+        run: |
+          HIGH=$(zap-cli alerts $TARGET_URL --level High | wc -l)
+          CRITICAL=$(zap-cli alerts $TARGET_URL --level Critical | wc -l)
+          if [ "$HIGH" -gt 0 ] || [ "$CRITICAL" -gt 0 ]; then
+            echo "High or Critical DAST vulnerabilities found"
+            exit 1
+          fi
+
+  # ------------------------------
+  # 3. Deploy to Staging
+  # ------------------------------
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: scan
+    steps:
+      - name: Azure Login
         uses: azure/login@v1
         with:
           creds: |
@@ -103,21 +170,60 @@ jobs:
               "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
             }
 
-      # Delete existing container (if any)
-      - name: Delete existing ACI (if any)
+      - name: Deploy Docker Image to Staging
         run: |
-          az container delete \
-            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
-            --name ${{ secrets.AZURE_CONTAINER_NAME }} \
-            --yes || true
-
-      # Deploy to Azure Container Instance
-      - name: Deploy to Azure Container Instance
-        run: |
+          az container delete --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} --name ${{ secrets.AZURE_CONTAINER_NAME }} --yes || true
           az container create \
             --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
             --name ${{ secrets.AZURE_CONTAINER_NAME }} \
-            --image ${{ secrets.DOCKER_USERNAME }}/react-app:latest \
+            --image $IMAGE_NAME:${{ needs.build.outputs.image-tag }} \
+            --cpu 1 --memory 1 \
+            --registry-login-server docker.io \
+            --registry-username ${{ secrets.DOCKER_USERNAME }} \
+            --registry-password ${{ secrets.DOCKER_PASSWORD }} \
+            --ports 80 \
+            --restart-policy Always \
+            --os-type Linux \
+            --ip-address Public \
+            --dns-name-label ${{ secrets.ACI_DNS_LABEL }} \
+            --environment-variables NODE_ENV=staging
+
+      - name: Run E2E Tests
+        run: npm run cypress:run || exit 1
+
+  # ------------------------------
+  # 4. Deploy to Production
+  # ------------------------------
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    environment:
+      name: production
+      url: https://${{ secrets.ACI_DNS_LABEL }}.azurecontainer.io
+    steps:
+      - name: Manual Approval Gate
+        uses: hmarr/auto-approve-action@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
+            }
+
+      - name: Deploy Docker Image to Production
+        run: |
+          az container delete --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} --name ${{ secrets.AZURE_CONTAINER_NAME }} --yes || true
+          az container create \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --name ${{ secrets.AZURE_CONTAINER_NAME }} \
+            --image $IMAGE_NAME:${{ needs.build.outputs.image-tag }} \
             --cpu 1 --memory 1 \
             --registry-login-server docker.io \
             --registry-username ${{ secrets.DOCKER_USERNAME }} \
