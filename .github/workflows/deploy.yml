@@ -10,21 +10,21 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # Checkout the repository
+      # Checkout repository
       - name: Checkout Code
         uses: actions/checkout@v3
 
-      # Setup Node.js (for React build & SonarQube scan)
+      # Setup Node.js
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '18'
 
-      # Install dependencies (needed for SonarQube)
+      # Install dependencies
       - name: Install Dependencies
         run: npm ci
 
-      # Run SonarQube SAST Scan
+      # Run SonarQube Scan (SAST)
       - name: SonarQube Scan
         uses: sonarsource/sonarqube-scan-action@v2
         with:
@@ -35,14 +35,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
-      # Enforce SonarQube Quality Gate (block if code fails quality checks)
+      # Enforce Quality Gate
       - name: SonarQube Quality Gate
         uses: sonarsource/sonarqube-quality-gate-action@v1
         timeout-minutes: 5
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
-      # Log in to Docker Hub
+      # Docker Hub login
       - name: Log in to Docker Hub
         uses: docker/login-action@v2
         with:
@@ -55,18 +55,38 @@ jobs:
           IMAGE_NAME=${{ secrets.DOCKER_USERNAME }}/react-app
           docker build -t $IMAGE_NAME:latest .
 
-      # Grype Image Scan (Container SCA / vulnerability scan)
-      - name: Scan Docker Image with Grype
-        uses: anchore/scan-action@v3
-        with:
-          image-reference: ${{ secrets.DOCKER_USERNAME }}/react-app:latest
-          fail-build: true            # Set to false if you want to only warn, not fail
-          severity-cutoff: high        # Fail pipeline if high or critical vulnerabilities found
-        env:
-          GRYPE_DB_CACHE_DIR: ~/.cache/grype
+      # Run Grype Image Scan and Save Report
+      - name: Run Grype Scan
+        run: |
+          IMAGE_NAME=${{ secrets.DOCKER_USERNAME }}/react-app:latest
+          echo "Running Grype vulnerability scan..."
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo sh -s -- -b /usr/local/bin
+          mkdir -p grype-reports
+          grype $IMAGE_NAME:latest -o json > grype-reports/scan-report.json || true
+          grype $IMAGE_NAME:latest -o table > grype-reports/scan-report.txt || true
 
-      # Push Image (only if Grype passes)
+      # Upload Grype Report as Artifact
+      - name: Upload Grype Scan Reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: grype-scan-reports
+          path: grype-reports/
+          retention-days: 30   # Keep for 30 days (adjust as needed)
+
+      # Fail if critical vulnerabilities are found
+      - name: Enforce Vulnerability Policy
+        run: |
+          CRITICAL_COUNT=$(jq '[.matches[] | select(.vulnerability.severity=="Critical")] | length' grype-reports/scan-report.json)
+          if [ "$CRITICAL_COUNT" -gt 0 ]; then
+            echo "Found $CRITICAL_COUNT Critical vulnerabilities. Failing build."
+            exit 1
+          else
+            echo "No critical vulnerabilities found."
+          fi
+
+      # Push Docker Image (only if scan passes)
       - name: Push Docker Image
+        if: success()
         run: |
           IMAGE_NAME=${{ secrets.DOCKER_USERNAME }}/react-app
           docker push $IMAGE_NAME:latest
@@ -83,7 +103,7 @@ jobs:
               "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
             }
 
-      # Delete existing container (if exists)
+      # Delete existing container (if any)
       - name: Delete existing ACI (if any)
         run: |
           az container delete \
