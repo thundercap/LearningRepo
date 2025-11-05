@@ -193,7 +193,7 @@ jobs:
     needs: deploy-staging
     environment:
       name: production
-      url: https://${{ secrets.ACI_DNS_LABEL }}.azurecontainer.io
+      # URL cannot use secrets, leave blank or use static URL
     steps:
       - name: Manual Approval Gate
         uses: hmarr/auto-approve-action@v2
