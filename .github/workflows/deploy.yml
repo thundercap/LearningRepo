@@ -28,8 +28,12 @@ jobs:
 
       - name: Clean and Install Dependencies
         run: |
-          rm -rf node_modules package-lock.json
-          npm ci
+          rm -rf node_modules
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
           npm install --save-dev @babel/plugin-proposal-private-property-in-object
 
       - name: Run Unit Tests with Coverage
