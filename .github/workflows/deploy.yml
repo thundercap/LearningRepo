@@ -3,7 +3,7 @@ name: Build, Scan & Deploy React App to Azure Container Instance
 on:
   push:
     branches:
-      - main   # or your deploy branch
+      - main
 
 env:
   IMAGE_NAME: ${{ secrets.DOCKER_USERNAME }}/react-app
@@ -44,19 +44,10 @@ jobs:
         run: echo "tag=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
       - name: Build Docker Image (Multi-stage)
-        run: |
-          docker build -t $IMAGE_NAME:${{ steps.set-image-tag.outputs.tag }} .
-
-      - name: Upload Docker Image for Later Jobs
-        uses: actions/upload-artifact@v4
-        with:
-          name: docker-image
-          path: |
-            Dockerfile
-            # optional: context files if needed
+        run: docker build -t $IMAGE_NAME:${{ steps.set-image-tag.outputs.tag }} .
 
   # ------------------------------
-  # 2. Scan Job (SAST, SCA, DAST)
+  # 2. Scan Job
   # ------------------------------
   scan:
     runs-on: ubuntu-latest
@@ -98,10 +89,6 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Build Docker Image for Scan
-        run: |
-          docker build -t $IMAGE_NAME:${{ needs.build.outputs.image-tag }} .
-
       - name: Run Grype Scan
         run: |
           curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo sh -s -- -b /usr/local/bin
@@ -131,8 +118,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y zaproxy
 
       - name: Run DAST Scan
+        env:
+          TARGET_URL: "http://${{ secrets.ACI_DNS_LABEL }}.azurecontainer.io"
         run: |
-          TARGET_URL="http://${{ secrets.ACI_DNS_LABEL }}.azurecontainer.io"
           mkdir -p dast-reports
           zap-cli quick-scan --self-contained -r dast-reports/dast-report.html $TARGET_URL
 
@@ -144,6 +132,8 @@ jobs:
           retention-days: 30
 
       - name: Fail on High/Critical DAST Findings
+        env:
+          TARGET_URL: "http://${{ secrets.ACI_DNS_LABEL }}.azurecontainer.io"
         run: |
           HIGH=$(zap-cli alerts $TARGET_URL --level High | wc -l)
           CRITICAL=$(zap-cli alerts $TARGET_URL --level Critical | wc -l)
@@ -171,12 +161,16 @@ jobs:
             }
 
       - name: Deploy Docker Image to Staging
+        env:
+          IMAGE_TAG: ${{ needs.build.outputs.image-tag }}
+          IMAGE_NAME: ${{ secrets.DOCKER_USERNAME }}/react-app
+          ACI_DNS_LABEL: ${{ secrets.ACI_DNS_LABEL }}
         run: |
           az container delete --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} --name ${{ secrets.AZURE_CONTAINER_NAME }} --yes || true
           az container create \
             --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
             --name ${{ secrets.AZURE_CONTAINER_NAME }} \
-            --image $IMAGE_NAME:${{ needs.build.outputs.image-tag }} \
+            --image $IMAGE_NAME:$IMAGE_TAG \
             --cpu 1 --memory 1 \
             --registry-login-server docker.io \
             --registry-username ${{ secrets.DOCKER_USERNAME }} \
@@ -185,7 +179,7 @@ jobs:
             --restart-policy Always \
             --os-type Linux \
             --ip-address Public \
-            --dns-name-label ${{ secrets.ACI_DNS_LABEL }} \
+            --dns-name-label $ACI_DNS_LABEL \
             --environment-variables NODE_ENV=staging
 
       - name: Run E2E Tests
@@ -218,12 +212,16 @@ jobs:
             }
 
       - name: Deploy Docker Image to Production
+        env:
+          IMAGE_TAG: ${{ needs.build.outputs.image-tag }}
+          IMAGE_NAME: ${{ secrets.DOCKER_USERNAME }}/react-app
+          ACI_DNS_LABEL: ${{ secrets.ACI_DNS_LABEL }}
         run: |
           az container delete --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} --name ${{ secrets.AZURE_CONTAINER_NAME }} --yes || true
           az container create \
             --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
             --name ${{ secrets.AZURE_CONTAINER_NAME }} \
-            --image $IMAGE_NAME:${{ needs.build.outputs.image-tag }} \
+            --image $IMAGE_NAME:$IMAGE_TAG \
             --cpu 1 --memory 1 \
             --registry-login-server docker.io \
             --registry-username ${{ secrets.DOCKER_USERNAME }} \
@@ -232,5 +230,5 @@ jobs:
             --restart-policy Always \
             --os-type Linux \
             --ip-address Public \
-            --dns-name-label ${{ secrets.ACI_DNS_LABEL }} \
+            --dns-name-label $ACI_DNS_LABEL \
             --environment-variables NODE_ENV=production
