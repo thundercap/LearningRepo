@@ -67,7 +67,7 @@ jobs:
 
       # Upload Grype Report as Artifact
       - name: Upload Grype Scan Reports
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: grype-scan-reports
           path: grype-reports/
