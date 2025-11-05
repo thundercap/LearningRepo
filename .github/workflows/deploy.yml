@@ -1,4 +1,4 @@
-name: Build & Deploy React App to Azure Container Instance
+name: Build, Scan & Deploy React App to Azure Container Instance
 
 on:
   push:
@@ -6,13 +6,42 @@ on:
       - main   # or your deploy branch
 
 jobs:
-  build-and-deploy:
+  build-scan-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
       # Checkout the repo
       - name: Checkout Code
         uses: actions/checkout@v3
+
+      # Setup Node (optional but useful for frontend builds or SonarQube scans)
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      # Install dependencies (needed for SonarQube analysis)
+      - name: Install Dependencies
+        run: |
+          npm ci
+
+      # Run SonarQube SAST Scan
+      - name: SonarQube Scan
+        uses: sonarsource/sonarqube-scan-action@v2
+        with:
+          args: >
+            -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }}
+            -Dsonar.login=${{ secrets.SONAR_TOKEN }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.TEGITHUB_TOKEN }}  # Needed for PR decoration
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      # (Optional) Quality Gate check — ensures code meets SonarQube standards before deployment
+      - name: SonarQube Quality Gate
+        uses: sonarsource/sonarqube-quality-gate-action@v1
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
       # Log in to Docker Hub
       - name: Log in to Docker Hub
@@ -40,13 +69,13 @@ jobs:
               "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
             }
 
+      # Delete existing ACI (if any)
       - name: Delete existing ACI (if any)
         run: |
           az container delete \
             --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
             --name ${{ secrets.AZURE_CONTAINER_NAME }} \
             --yes || true
-
 
       # Deploy to Azure Container Instance
       - name: Deploy to ACI
