@@ -437,7 +437,7 @@ jobs:
         with:
           payload: |
             {
-              "text": "✅ *Production deploy succeeded*",
+              "text": "*Production deploy succeeded*",
               "attachments": [{
                 "color": "good",
                 "fields": [
@@ -459,7 +459,7 @@ jobs:
         with:
           payload: |
             {
-              "text": "🚨 *Production deploy FAILED — rollback initiated*",
+              "text": "*Production deploy FAILED — rollback initiated*",
               "attachments": [{
                 "color": "danger",
                 "fields": [
@@ -533,7 +533,7 @@ jobs:
         with:
           payload: |
             {
-              "text": "${{ job.status == 'success' && '⚠️ *Production rolled back successfully* to previous stable version.' || '🔥 *ROLLBACK FAILED* — manual intervention required immediately.' }}",
+              "text": "${{ job.status == 'success' && '*Production rolled back successfully* to previous stable version.' || '🔥 *ROLLBACK FAILED* — manual intervention required immediately.' }}",
               "attachments": [{
                 "color": "${{ job.status == 'success' && 'warning' || 'danger' }}",
                 "fields": [
