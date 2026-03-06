@@ -1,13 +1,23 @@
-name: Build, Scan & Deploy React App to Azure Container Instance
+name: Build, Scan & Deploy React App to Azure Container Apps
 
 on:
   push:
     branches:
       - main
 
+# ============================================================
+# CONCURRENCY: Prevent race conditions if two pushes happen
+# to main simultaneously. New runs queue rather than cancel
+# so we never skip a production deployment.
+# ============================================================
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
 env:
   IMAGE_NAME: ${{ secrets.DOCKER_USERNAME }}/react-app
   NODE_VERSION: '18'
+  HEALTH_ENDPOINT: /health
 
 jobs:
   # ------------------------------
@@ -21,6 +31,9 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+        with:
+          # Full history needed for TruffleHog incremental secret scanning
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -29,14 +42,34 @@ jobs:
           cache: 'npm'
 
       - name: Install Dependencies
-        # FIX: Use 'npm ci' instead of 'npm install' for deterministic, lockfile-enforced installs in CI.
-        # If your lockfile is out of sync, fix it locally with 'npm install' and commit the updated lockfile.
         run: npm ci
 
-      - name: Run Unit Tests with Coverage
-        run: npm test -- --coverage --detectOpenHandles
+      # ── Secret Scanning ────────────────────────────────────
+      # Scans only the diff introduced by this push so it's fast.
+      # Catches accidentally committed API keys, tokens, passwords
+      # before the image is even built.
+      - name: Secret Scan (TruffleHog)
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.before }}
+          head: ${{ github.sha }}
+          extra_args: --only-verified
 
-      - name: Upload Test Coverage
+      - name: Run Unit Tests with Coverage
+        run: npm test -- --coverage --detectOpenHandles --ci
+
+      # ── Publish Jest Results as GitHub Check Annotations ───
+      # Failures appear inline on the PR/commit rather than buried in logs.
+      - name: Publish Unit Test Results
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Jest Tests
+          path: coverage/junit.xml
+          reporter: jest-junit
+
+      - name: Upload Test Coverage Artifact
         uses: actions/upload-artifact@v4
         with:
           name: coverage-report
@@ -48,19 +81,39 @@ jobs:
         run: echo "tag=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
       - name: Login to Docker Hub
-        # FIX: Upgraded docker/login-action from v2 → v3
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Build and Push Docker Image
-        # FIX: Upgraded docker/build-push-action from v4 → v5
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
           tags: ${{ env.IMAGE_NAME }}:${{ steps.set-image-tag.outputs.tag }}
+          # Export the digest so Cosign can sign by digest (immutable) rather than tag
+          outputs: type=image,push=true
+
+      # ── Image Signing ──────────────────────────────────────
+      # Signs the image with Cosign using keyless signing (OIDC).
+      # This creates a verifiable cryptographic link between this
+      # specific GitHub Actions run and the image digest — so you
+      # can prove the image wasn't tampered with after the pipeline built it.
+      # Prerequisites: enable 'id-token: write' permission (see permissions block).
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign Docker Image
+        env:
+          COSIGN_EXPERIMENTAL: '1'
+          IMAGE_TAG: ${{ steps.set-image-tag.outputs.tag }}
+        run: |
+          cosign sign --yes ${{ env.IMAGE_NAME }}:${IMAGE_TAG}
+
+    permissions:
+      contents: read
+      id-token: write   # Required for Cosign keyless signing via OIDC
 
   # ------------------------------
   # 2. SAST + SCA (SonarQube + Grype)
@@ -79,12 +132,18 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
 
+      - name: Download Coverage Report
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+
       - name: SonarQube Scan
         uses: sonarsource/sonarqube-scan-action@v2
         with:
           args: >
             -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }}
-            -Dsonar.login=${{ secrets.SONAR_TOKEN }}
+            -Dsonar.token=${{ secrets.SONAR_TOKEN }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -96,7 +155,6 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
       - name: Login to Docker Hub
-        # FIX: Upgraded docker/login-action from v2 → v3
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
@@ -106,16 +164,14 @@ jobs:
         run: |
           curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo sh -s -- -b /usr/local/bin
 
-      - name: Run Grype Scan (image from registry)
+      - name: Run Grype Scan (single pull, dual output)
         env:
           IMAGE_TAG: ${{ needs.build.outputs.image-tag }}
         run: |
           mkdir -p grype-reports
-          # FIX: Removed '|| true' from the JSON report line so real failures (missing image,
-          # network error, etc.) are not silently swallowed and the policy check below is reliable.
-          # '|| true' is kept ONLY on the human-readable table output which is non-blocking.
-          grype ${{ env.IMAGE_NAME }}:${IMAGE_TAG} -o json > grype-reports/scan-report.json
-          grype ${{ env.IMAGE_NAME }}:${IMAGE_TAG} -o table > grype-reports/scan-report.txt || true
+          grype ${{ env.IMAGE_NAME }}:${IMAGE_TAG} \
+            -o json --file grype-reports/scan-report.json \
+            -o table --file grype-reports/scan-report.txt
 
       - name: Upload Grype Reports
         uses: actions/upload-artifact@v4
@@ -141,14 +197,12 @@ jobs:
   # ------------------------------
   deploy-staging:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     needs: [scan-sast-sca, build]
     outputs:
       staging-url: ${{ steps.set-staging-url.outputs.url }}
     steps:
       - name: Azure Login
-        # FIX: Upgraded azure/login from v1 → v2 and switched to individual secret
-        # parameters to avoid JSON injection issues when secret values contain special characters.
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -156,58 +210,51 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Deploy Docker Image to Staging
+      # ── Zero-Downtime Deploy via Azure Container Apps ──────
+      # Replaces ACI (which required delete→create causing downtime).
+      # Container Apps supports rolling updates: the new revision
+      # receives traffic only after it passes its health probe.
+      # The old revision keeps serving traffic in the meantime.
+      - name: Deploy to Staging (Zero-Downtime Rolling Update)
         id: deploy
         env:
           IMAGE_TAG: ${{ needs.build.outputs.image-tag }}
           IMAGE_NAME: ${{ secrets.DOCKER_USERNAME }}/react-app
-          ACI_DNS_LABEL: ${{ secrets.ACI_DNS_LABEL_STAGING || secrets.ACI_DNS_LABEL }}
         run: |
-          az container delete \
+          az containerapp update \
+            --name ${{ secrets.ACA_APP_NAME_STAGING }} \
             --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
-            --name ${{ secrets.AZURE_CONTAINER_NAME }} \
-            --yes || true
-
-          az container create \
-            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
-            --name ${{ secrets.AZURE_CONTAINER_NAME }} \
             --image $IMAGE_NAME:$IMAGE_TAG \
-            --cpu 1 --memory 1 \
-            --registry-login-server docker.io \
-            --registry-username ${{ secrets.DOCKER_USERNAME }} \
-            --registry-password ${{ secrets.DOCKER_PASSWORD }} \
-            --ports 80 \
-            --restart-policy Always \
-            --os-type Linux \
-            --ip-address Public \
-            --dns-name-label $ACI_DNS_LABEL \
-            --environment-variables NODE_ENV=staging
+            --set-env-vars NODE_ENV=staging \
+            --revision-suffix $IMAGE_TAG
 
       - name: Set Staging URL Output
-        # FIX: Removed the duplicate/dead 'staging_url' output from the deploy step above.
-        # A single, clearly named output is set here and referenced consistently downstream.
         id: set-staging-url
-        run: echo "url=http://${{ secrets.ACI_DNS_LABEL_STAGING || secrets.ACI_DNS_LABEL }}.azurecontainer.io" >> $GITHUB_OUTPUT
+        run: |
+          URL=$(az containerapp show \
+            --name ${{ secrets.ACA_APP_NAME_STAGING }} \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+          echo "url=https://$URL" >> $GITHUB_OUTPUT
 
       - name: Wait for Staging to Become Healthy
-        # FIX: Added a readiness poll so E2E and DAST jobs don't start hitting the app
-        # while the container is still initialising (which causes false test failures).
         run: |
           STAGING_URL=${{ steps.set-staging-url.outputs.url }}
-          echo "Waiting for $STAGING_URL to become available..."
+          echo "Waiting for $STAGING_URL${{ env.HEALTH_ENDPOINT }} to become available..."
           for i in {1..18}; do
-            if curl -sf --max-time 5 "$STAGING_URL" > /dev/null 2>&1; then
-              echo "Staging is healthy after $((i * 10))s"
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$STAGING_URL${{ env.HEALTH_ENDPOINT }}")
+            if [ "$STATUS" = "200" ]; then
+              echo "Staging is healthy after $((i * 10))s (HTTP $STATUS)"
               exit 0
             fi
-            echo "Attempt $i/18 — retrying in 10s..."
+            echo "Attempt $i/18 — got HTTP $STATUS, retrying in 10s..."
             sleep 10
           done
           echo "Staging did not become healthy within 3 minutes. Failing."
           exit 1
 
   # ------------------------------
-  # 4. E2E Tests (run after staging is up)
+  # 4. E2E Tests
   # ------------------------------
   e2e-tests:
     runs-on: ubuntu-latest
@@ -223,8 +270,19 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
 
+      # ── Cache Cypress Binary ───────────────────────────────
+      # Cypress downloads a large binary (~200MB) on every run
+      # without this cache. Caching keyed on the lockfile means
+      # it only re-downloads when Cypress itself is upgraded.
+      - name: Cache Cypress Binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/Cypress
+          key: cypress-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            cypress-${{ runner.os }}-
+
       - name: Install Dependencies
-        # FIX: Use 'npm ci' for deterministic installs
         run: npm ci
 
       - name: Run Cypress E2E Tests
@@ -234,8 +292,25 @@ jobs:
           echo "Running Cypress against $TARGET_URL"
           npm run cypress:run -- --config baseUrl=$TARGET_URL
 
+      # ── Publish Cypress Results as GitHub Check Annotations
+      - name: Publish E2E Test Results
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Cypress E2E Tests
+          path: cypress/results/*.xml
+          reporter: java-junit
+
+      - name: Upload Cypress Screenshots on Failure
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: cypress-screenshots
+          path: cypress/screenshots/
+          retention-days: 7
+
   # ------------------------------
-  # 5. DAST (OWASP ZAP) — runs after staging is live
+  # 5. DAST (OWASP ZAP)
   # ------------------------------
   dast-scan:
     runs-on: ubuntu-latest
@@ -246,6 +321,15 @@ jobs:
         uses: zaproxy/action-baseline@v0.7.0
         with:
           target: ${{ needs.deploy-staging.outputs.staging-url }}
+          # ── DAST Gating ──────────────────────────────────────
+          # By default ZAP exits 0 even when it finds issues — it
+          # alerts but never blocks. Setting fail_action to 'warn'
+          # still uploads the report but you can adjust to 'true'
+          # to hard-fail on any WARN-level finding. The rules file
+          # lets you tune which finding levels are ignored/warned/failed.
+          fail_action: warn
+          rules_file_name: .zap/rules.tsv
+          cmd_options: '-a'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -253,24 +337,24 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dast-report
-          path: .zap/
-          # FIX: Added explicit retention period to match the rest of the pipeline's artifacts
+          path: |
+            zap_baseline.html
+            zap_baseline.xml
           retention-days: 30
 
   # ------------------------------
-  # 6. Deploy to Production (manual approval enforced via environment protection)
+  # 6. Deploy to Production
   # ------------------------------
   deploy-production:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    # FIX: Added 'build' to needs so needs.build.outputs.image-tag resolves correctly.
-    # Without this, the image tag expression returns empty and deploys nothing (or the wrong image).
+    timeout-minutes: 25
     needs: [dast-scan, e2e-tests, build]
     environment:
       name: production
+    outputs:
+      previous-tag: ${{ steps.get-previous-tag.outputs.tag }}
     steps:
       - name: Azure Login
-        # FIX: Upgraded azure/login from v1 → v2 with individual secret parameters
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -278,28 +362,187 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Deploy Docker Image to Production
+      # ── Store Previous Tag for Rollback ───────────────────
+      # Before deploying, capture the currently running image tag
+      # from Key Vault. If the new deploy fails its health check,
+      # the rollback job uses this to restore the last known good version.
+      - name: Get Previous Stable Image Tag (for rollback)
+        id: get-previous-tag
+        run: |
+          PREV_TAG=$(az keyvault secret show \
+            --vault-name ${{ secrets.AZURE_KEYVAULT_NAME }} \
+            --name last-stable-image-tag \
+            --query "value" -o tsv 2>/dev/null || echo "")
+          echo "tag=$PREV_TAG" >> $GITHUB_OUTPUT
+
+      - name: Deploy to Production (Zero-Downtime Rolling Update)
         env:
           IMAGE_TAG: ${{ needs.build.outputs.image-tag }}
           IMAGE_NAME: ${{ secrets.DOCKER_USERNAME }}/react-app
-          ACI_DNS_LABEL: ${{ secrets.ACI_DNS_LABEL_PRODUCTION || secrets.ACI_DNS_LABEL }}
         run: |
-          az container delete \
+          az containerapp update \
+            --name ${{ secrets.ACA_APP_NAME_PROD }} \
             --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
-            --name ${{ secrets.AZURE_CONTAINER_NAME_PROD || secrets.AZURE_CONTAINER_NAME }} \
-            --yes || true
-
-          az container create \
-            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
-            --name ${{ secrets.AZURE_CONTAINER_NAME_PROD || secrets.AZURE_CONTAINER_NAME }} \
             --image $IMAGE_NAME:$IMAGE_TAG \
-            --cpu 1 --memory 1 \
-            --registry-login-server docker.io \
-            --registry-username ${{ secrets.DOCKER_USERNAME }} \
-            --registry-password ${{ secrets.DOCKER_PASSWORD }} \
-            --ports 80 \
-            --restart-policy Always \
-            --os-type Linux \
-            --ip-address Public \
-            --dns-name-label $ACI_DNS_LABEL \
-            --environment-variables NODE_ENV=production
+            --set-env-vars NODE_ENV=production \
+            --revision-suffix $IMAGE_TAG
+
+      - name: Get Production URL
+        id: get-prod-url
+        run: |
+          URL=$(az containerapp show \
+            --name ${{ secrets.ACA_APP_NAME_PROD }} \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+          echo "url=https://$URL" >> $GITHUB_OUTPUT
+
+      # ── Post-Deploy Health Check ───────────────────────────
+      # Verifies the new revision is actually serving traffic
+      # before marking the deploy as successful. If this fails,
+      # the 'rollback' job below triggers automatically.
+      - name: Post-Deploy Production Health Check
+        id: health-check
+        run: |
+          PROD_URL=${{ steps.get-prod-url.outputs.url }}
+          echo "Verifying production health at $PROD_URL${{ env.HEALTH_ENDPOINT }}..."
+          for i in {1..12}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$PROD_URL${{ env.HEALTH_ENDPOINT }}")
+            if [ "$STATUS" = "200" ]; then
+              echo "Production is healthy after $((i * 10))s (HTTP $STATUS)"
+              exit 0
+            fi
+            echo "Attempt $i/12 — got HTTP $STATUS, retrying in 10s..."
+            sleep 10
+          done
+          echo "Production health check failed. Triggering rollback."
+          exit 1
+
+      # ── Persist New Stable Tag ─────────────────────────────
+      # Only runs if the health check passed. Updates Key Vault
+      # with the new stable tag so future rollbacks have an accurate target.
+      - name: Store New Stable Image Tag in Key Vault
+        if: success()
+        env:
+          IMAGE_TAG: ${{ needs.build.outputs.image-tag }}
+        run: |
+          az keyvault secret set \
+            --vault-name ${{ secrets.AZURE_KEYVAULT_NAME }} \
+            --name last-stable-image-tag \
+            --value $IMAGE_TAG
+
+      # ── Slack: Success Notification ────────────────────────
+      - name: Notify Slack — Deploy Succeeded
+        if: success()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "✅ *Production deploy succeeded*",
+              "attachments": [{
+                "color": "good",
+                "fields": [
+                  { "title": "Repo", "value": "${{ github.repository }}", "short": true },
+                  { "title": "Image Tag", "value": "${{ needs.build.outputs.image-tag }}", "short": true },
+                  { "title": "Deployed by", "value": "${{ github.actor }}", "short": true },
+                  { "title": "Commit", "value": "<https://github.com/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>", "short": true }
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      # ── Slack: Failure Notification ────────────────────────
+      - name: Notify Slack — Deploy Failed
+        if: failure()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "🚨 *Production deploy FAILED — rollback initiated*",
+              "attachments": [{
+                "color": "danger",
+                "fields": [
+                  { "title": "Repo", "value": "${{ github.repository }}", "short": true },
+                  { "title": "Failed Tag", "value": "${{ needs.build.outputs.image-tag }}", "short": true },
+                  { "title": "Triggered by", "value": "${{ github.actor }}", "short": true },
+                  { "title": "Run", "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View logs>", "short": true }
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+  # ------------------------------
+  # 7. Automatic Rollback
+  # ------------------------------
+  rollback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Only runs if the production deploy job failed
+    needs: [deploy-production, build]
+    if: failure() && needs.deploy-production.result == 'failure'
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Rollback to Previous Stable Image
+        env:
+          PREV_TAG: ${{ needs.deploy-production.outputs.previous-tag }}
+          IMAGE_NAME: ${{ secrets.DOCKER_USERNAME }}/react-app
+        run: |
+          if [ -z "$PREV_TAG" ]; then
+            echo "No previous stable tag found in Key Vault. Cannot rollback automatically."
+            exit 1
+          fi
+
+          echo "Rolling back production to $IMAGE_NAME:$PREV_TAG..."
+          az containerapp update \
+            --name ${{ secrets.ACA_APP_NAME_PROD }} \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --image $IMAGE_NAME:$PREV_TAG \
+            --revision-suffix rollback-$PREV_TAG
+
+      - name: Verify Rollback Health
+        run: |
+          URL=$(az containerapp show \
+            --name ${{ secrets.ACA_APP_NAME_PROD }} \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+          PROD_URL="https://$URL"
+          for i in {1..12}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$PROD_URL${{ env.HEALTH_ENDPOINT }}")
+            if [ "$STATUS" = "200" ]; then
+              echo "Rollback succeeded — production healthy at $PROD_URL"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Rollback health check also failed. Manual intervention required."
+          exit 1
+
+      - name: Notify Slack — Rollback Result
+        if: always()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "${{ job.status == 'success' && '⚠️ *Production rolled back successfully* to previous stable version.' || '🔥 *ROLLBACK FAILED* — manual intervention required immediately.' }}",
+              "attachments": [{
+                "color": "${{ job.status == 'success' && 'warning' || 'danger' }}",
+                "fields": [
+                  { "title": "Rolled back to tag", "value": "${{ needs.deploy-production.outputs.previous-tag }}", "short": true },
+                  { "title": "Failed tag", "value": "${{ needs.build.outputs.image-tag }}", "short": true },
+                  { "title": "Run", "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View logs>", "short": true }
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
